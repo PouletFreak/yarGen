@@ -25,6 +25,7 @@ from hashlib import sha256
 from naiveBayesClassifier import tokenizer
 from naiveBayesClassifier.trainer import Trainer
 from naiveBayesClassifier.classifier import Classifier
+from s3connector.s3connector import s3conn
 import signal as signal_module
 
 try:
@@ -107,7 +108,7 @@ def get_files(dir, notRecursive):
                 yield filePath
 
 
-def parse_sample_dir(dir, notRecursive=False, generateInfo=False, onlyRelevantExtensions=False):
+def parse_sample_dir(dir="./s3connector/dropzone/", notRecursive=False, generateInfo=False, onlyRelevantExtensions=False):
     # Prepare dictionary
     string_stats = {}
     opcode_stats = {}
@@ -977,11 +978,11 @@ def generate_general_condition(file_info):
     return condition_string, pe_module_neccessary
 
 
-def generate_rules(file_strings, file_opcodes, super_rules, file_info, inverse_stats):
+def generate_rules(file_strings, file_opcodes, super_rules, file_info, inverse_stats, outputfile_name):
     # Write to file ---------------------------------------------------
     if args.o:
         try:
-            fh = open(args.o, 'w')
+            fh = open(outputfile_name, 'w')
         except Exception, e:
             traceback.print_exc()
 
@@ -1731,7 +1732,7 @@ def update_databases():
         sys.exit(1)
 
 
-def processSampleDir(targetDir):
+def processSampleDir(targetDir, outputfile_name):
     """
     Processes samples in a given directory and creates a yara rule file
     :param directory:
@@ -1753,7 +1754,7 @@ def processSampleDir(targetDir):
 
     # Create Rule Files
     (rule_count, inverse_rule_count, super_rule_count) = \
-        generate_rules(file_strings, file_opcodes, super_rules, file_info, inverse_stats)
+        generate_rules(file_strings, file_opcodes, super_rules, file_info, inverse_stats, outputfile_name)
 
     if args.inverse:
         print "[=] Generated %s INVERSE rules." % str(inverse_rule_count)
@@ -1761,7 +1762,7 @@ def processSampleDir(targetDir):
         print "[=] Generated %s SIMPLE rules." % str(rule_count)
         if not nosuper:
             print "[=] Generated %s SUPER rules." % str(super_rule_count)
-        print "[=] All rules written to %s" % args.o
+        print "[=] All rules written to %s" % outputfile_name
 
 
 def emptyFolder(dir):
@@ -2203,12 +2204,21 @@ if __name__ == '__main__':
     # If malware directory given
     if args.m:
 
+        dropzone_dir = os.path.dirname(os.path.realpath(__file__)) + '/s3connector/dropzone'
+
+        try:
+            if not os.path.exists(dropzone_dir):
+                os.makedirs(dropzone_dir)
+        except OSError:
+            print 'Problem making file directory'
+
+
         # Initialize Bayes Trainer (we will use the goodware string database for this)
         print "[+] Initializing Bayes Filter ..."
         stringTrainer = initialize_bayes_filter()
 
         # Deactivate super rule generation if there's only a single file in the folder
-        if len(os.listdir(args.m)) < 2:
+        if len(os.listdir(dropzone_dir)) < 2:
             nosuper = True
 
         # Special strings
@@ -2222,26 +2232,44 @@ if __name__ == '__main__':
             # Monitoring folder for changes
             print "Monitoring %s for new sample files (processed samples will be removed)" % args.m
             while(True):
-                if len(os.listdir(args.m)) > 0:
-                    # Deactivate super rule generation if there's only a single file in the folder
-                    if len(os.listdir(args.m)) < 2:
-                        nosuper = True
-                    else:
-                        nosuper = False
-                    # Read a new identifier
-                    identifier = getIdentifier(args.b, args.m)
-                    # Read a new reference
-                    reference = getReference(args.r)
-                    # Generate a new description prefix
-                    prefix = getPrefix(args.p, identifier)
-                    # Process the samples
-                    processSampleDir(args.m)
-                    # Delete all samples from the dropzone folder
-                    emptyFolder(args.m)
-                time.sleep(1)
+                try:
+                    s3co = s3conn()
+                    filepaths = s3co.download_all_files()
+                except Exception:
+                    print "[!] Error during s3 file download"
+                    filepaths = None
+                    traceback.print_exc(file=sys.stdout)
+                    pass
+
+                if filepaths:
+
+                    if len(os.listdir(dropzone_dir)) > 0:
+                        date_obj = datetime.datetime.now()
+                        now_str = date_obj.strftime("%Y-%m-%d_%H%M%S")
+                        outputfile_name = "yargen_rule_{}.yar".format(now_str)
+                        # Deactivate super rule generation if there's only a single file in the folder
+                        if len(os.listdir(dropzone_dir)) < 2:
+                            nosuper = True
+                        else:
+                            nosuper = False
+                        # Read a new identifier
+                        identifier = getIdentifier(args.b, args.m)
+                        # Read a new reference
+                        reference = getReference(args.r)
+                        # Generate a new description prefix
+                        prefix = getPrefix(args.p, identifier)
+                        # Process the samples
+                        processSampleDir(dropzone_dir, outputfile_name)
+                        # Delete all samples from the dropzone folder
+                        emptyFolder(dropzone_dir)
+                    s3co.delete_keys()
+                    s3co.upload(outputfile_name, 'yararules', outputfile_name)
+                time.sleep(5)
         else:
             # Scan malware files
             print "[+] Processing malware files ..."
             processSampleDir(args.m)
 
         print "[+] yarGen run finished"
+
+
